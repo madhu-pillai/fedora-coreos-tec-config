@@ -1,0 +1,225 @@
+#!/usr/bin/python3 -u
+
+# This file originally lived in
+# https://github.com/coreos/fedora-coreos-releng-automation. See that repo for
+# archeological git research.
+
+'''
+    Implements the Fedora CoreOS versioning scheme as per:
+        https://github.com/coreos/fedora-coreos-tracker/issues/81
+        https://github.com/coreos/fedora-coreos-tracker/issues/211
+    And also the RHCOS/SCOS versioning scheme such as:
+        9.8.20260125-0
+'''
+
+import argparse
+import dotenv
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import time
+import yaml
+
+from datetime import datetime
+
+# https://github.com/coreos/fedora-coreos-tracker/issues/211#issuecomment-543547587
+FCOS_STREAM_TO_NUM = {
+    'next': 1,
+    'testing': 2,
+    'stable': 3,
+    'next-devel': 10,
+    'testing-devel': 20,
+    'tec': 30,
+    'rawhide': 91,
+    'branched': 92,
+    'bodhi-updates-testing': 93,
+    'bodhi-updates': 94,
+}
+
+
+def main():
+    args = parse_args()
+    if args.workdir is not None:
+        os.chdir(args.workdir)
+    assert os.path.isdir('builds'), 'Missing builds/ dir'
+
+    # Initialize all the components of our versions
+    x, y, z, n = (None, None, None, None)
+
+    # Pick up values from our build-args.
+    config = dotenv.dotenv_values(args.build_args)
+
+    # Grab the current datetime object representing the timestamp
+    # for the timestamp component of our version.
+    dt = get_timestamp()
+
+    # The base version in FCOS is a single number (i.e. 43) while
+    # in RHCOS/SCOS it's two numbers separated by . (i.e. 9.8 or 10.0)
+    x, y = split_base_version(config['VERSION'])
+
+    # The y component in FCOS is the timestamp, while in RHCOS/SCOS
+    # it's the z component. We'll convert to a YYYYMMDD formatted string.
+    if y is None:
+        y = int(dt.strftime('%Y%m%d'))
+    else:
+        z = int(dt.strftime('%Y%m%d'))
+
+    # At this point if z isn't defined then we're FCOS
+    if z is None:
+        z = FCOS_STREAM_TO_NUM[config['STREAM']]
+
+    # For !FCOS and in dev mode we'll default to getting the build ID
+    # n component by incrementing on top of the last build. For FCOS
+    # not in dev mode we'll calculate the n by looking at git history.
+    if args.dev or config['ID'] != 'fedora':
+        n = get_next_iteration_from_builds(x, y, z)
+    else:
+        n = get_next_iteration_from_git(str(dt))
+
+    # On !FCOS the delimeter for the `n` component is a -
+    n_delimiter = '.' if config['ID'] == 'fedora' else '-'
+
+    # Now we can compute the final version. Note we prepend the
+    # `dev` string for the n component if --dev was passed.
+    dev = 'dev' if args.dev else ''
+    new_version = f'{x}.{y}.{z}{n_delimiter}{dev}{n}'
+    eprint(f'VERSIONARY: selected new version for build: {new_version}')
+
+    # sanity check the new version by trying to re-parse it
+    assert parse_version(new_version) is not None
+    print(new_version)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--build-args', help="path to build-args.conf",
+                        default='src/config/build-args.conf')
+    parser.add_argument('--workdir', help="path to cosa workdir")
+    parser.add_argument(
+        "--dev", action="store_true", help="generate a developer version"
+    )
+    return parser.parse_args()
+
+
+def get_timestamp():
+    """
+        Get the timestamp from either the lockfiles, or use the
+        current time if no lockfiles exist.
+    """
+
+    # XXX: should sanity check that the lockfiles for all the basearches have
+    # matching timestamps
+    exts = ['json', 'yaml']
+    basearch = platform.machine()
+    for ext in exts:
+        try:
+            with open(f"src/config/manifest-lock.{basearch}.{ext}") as f:
+                lockfile = yaml.safe_load(f)
+                generated = lockfile.get('metadata', {}).get('generated')
+                if not generated:
+                    raise Exception("Missing 'metadata.generated' key "
+                                    f"from {lockfile}")
+                dt = datetime.strptime(generated, '%Y-%m-%dT%H:%M:%SZ')
+                msg_src = "from lockfile"
+                break
+        except FileNotFoundError:
+            continue
+    else:
+        msg_src = "from datetime.now()"
+        dt = datetime.now()
+
+    eprint(f"timestamp: {dt.strftime('%Y%m%d')} ({msg_src})")
+    return dt
+
+
+def split_base_version(base_version):
+    components = base_version.split('.')
+    if len(components) == 1:
+        return int(components[0]), None
+    else:
+        return int(components[0]), int(components[1])
+
+
+def get_next_iteration_from_builds(x, y, z):
+    try:
+        with open('builds/builds.json') as f:
+            builds = json.load(f)
+    except FileNotFoundError:
+        builds = {'builds': []}
+
+    if len(builds['builds']) == 0:
+        eprint("n: 0 (no previous builds)")
+        return 0
+
+    last_buildid = builds['builds'][0]['id']
+    last_version_tuple = parse_version(last_buildid)
+    if not last_version_tuple:
+        eprint(f"n: 0 (previous version {last_buildid} does not match scheme)")
+        return 0
+
+    if (x, y, z) != last_version_tuple[:3]:
+        eprint(f"n: 0 (previous version {last_buildid} x.y.z does not match)")
+        return 0
+
+    n = last_version_tuple[3] + 1
+    eprint(f"n: {n} (incremented from previous version {last_buildid})")
+    return n
+
+
+def get_next_iteration_from_git(timestamp):
+    """
+    Compute the next iteration number based on git commit history.
+
+    Given the Y component of the version (YYYY-MM-DD HH:MM:SS date),
+    this counts all commits from the start of that date up to HEAD.
+    This guarantees that multiple builds on the same day each receive a
+    unique `.n` value, even if several changes occur.
+
+    See: https://github.com/coreos/fedora-coreos-tracker/issues/2015
+    """
+    try:
+        # Count commits after that point
+        commit_count_since_change = subprocess.check_output(
+            ['git', 'rev-list', '--count', '--after', timestamp, 'HEAD'],
+            cwd="src/config", text=True
+        ).strip()
+        eprint(
+            f"n: {commit_count_since_change} "
+            "(calculated using git commit history)"
+        )
+        return int(commit_count_since_change)
+    except subprocess.CalledProcessError as err:
+        msg = (
+            "Git command failed: unable to determine the next "
+            f"iteration value ({err})"
+        )
+        raise RuntimeError(msg) from err
+
+
+def parse_version(version):
+    # Note that (?:pattern) os a non-matching group in python regex so
+    # it won't show up in the matched m.groups()
+    m = re.match(r'^([0-9]+)\.([0-9]+)\.([0-9]+)(?:\.|-)(?:dev)?([0-9]+)$', version)
+    if m is None:
+        return None
+    # sanity-check date. The time could be in the y component or z component
+    # so we have to look for it in either.
+    timegroup = 2
+    if len(m.group(3)) == 8:
+        timegroup = 3
+    try:
+        time.strptime(m.group(timegroup), '%Y%m%d')
+    except ValueError:
+        return None
+    return tuple(map(int, m.groups()))
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
