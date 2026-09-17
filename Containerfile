@@ -27,8 +27,16 @@ RUN set -xeuo pipefail && \
     stock_arguments=$(echo "$raw_args" | sed "s/'//g") && \
     echo "Using kernel: $KERNEL_VERSION" && \
     echo "Dracut arguments: $stock_arguments" && \
-    mkdir -p /tmp/dracut /var/roothome && \
-    dracut $stock_arguments && \
+    mkdir -p /tmp/dracut /var/roothome /var/tmp&& \
+     # Apply override RPMs if present (replaces KBC/CLEVIS/IGNITION images)
+    if ls /src/overrides/rpm/*.rpm 2>/dev/null; then \
+        dnf install -y /src/overrides/rpm/*.rpm; \
+    fi && \
+    # Apply override binaries/files if present
+    if [ -d /src/overrides/rootfs ] && [ "$(ls -A /src/overrides/rootfs 2>/dev/null)" ]; then \
+        cp -rT /src/overrides/rootfs /; \
+    fi && \
+    dracut --kver "$KERNEL_VERSION" $stock_arguments && \
     mv -v /boot/initramfs*.img "/lib/modules/${KERNEL_VERSION}/initramfs.img" && \
     bootc container lint
 
