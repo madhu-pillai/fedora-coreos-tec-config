@@ -1,6 +1,7 @@
 #!/bin/bash
 
 check() {
+    require_binaries /usr/bin/trustee-attester || return 1
     return 0
 }
 
