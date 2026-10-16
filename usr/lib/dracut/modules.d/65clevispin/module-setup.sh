@@ -10,7 +10,12 @@ depends() {
 
 install () {
    inst /usr/bin/trustee-attester
-	inst /usr/bin/clevis-pin-trustee
-	inst /usr/bin/clevis-encrypt-trustee
-	inst /usr/bin/clevis-decrypt-trustee
+   inst /usr/bin/clevis-pin-trustee
+   inst /usr/bin/clevis-encrypt-trustee
+   inst /usr/bin/clevis-decrypt-trustee
+
+   # Temporary fix for trustee-attester clevis bind issue in RHCOS10.2
+   # https://github.com/confidential-containers/guest-components/issues/1857
+   mkdir -p "$initdir/etc/systemd/system.conf.d"
+   echo -e '[Manager]\nDefaultEnvironment=RUST_LOG=""' > "$initdir/etc/systemd/system.conf.d/suppress-rust-log.conf"
 }
